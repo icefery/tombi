@@ -150,35 +150,26 @@ async fn redirects_within_an_explicitly_trusted_host_remain_supported() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn private_dns_answers_are_reported_as_policy_denials() {
+async fn domain_names_resolving_to_loopback_are_not_denied() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 1024];
+        let _ = stream.read(&mut request);
+        let body = br#"{"type":"object"}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\n\r\n").unwrap();
+        stream.write_all(body).unwrap();
+    });
+
     let client = super::ReqwestHttpClient::with_policy(Arc::new(
         crate::schema_fetch_policy::SchemaFetchPolicy::default(),
     ));
-    let result = client.get_bytes("http://localhost/schema.json").await;
+    let url = format!("http://localhost:{}/schema.json", address.port());
+    let body = client.get_bytes(&url).await.unwrap();
+    server.join().unwrap();
 
-    assert!(matches!(result, Err(crate::FetchError::HostNotTrusted)));
-}
-
-#[rstest]
-#[case::configured_proxy(&["localhost"], true)]
-#[case::any_other_host(&["proxy.corp.example"], false)]
-#[tokio::test(flavor = "current_thread")]
-async fn only_configured_proxy_hosts_may_resolve_to_private_addresses(
-    #[case] proxy_hosts: &[&str],
-    #[case] allowed: bool,
-) {
-    use reqwest::dns::Resolve;
-    use std::str::FromStr;
-
-    let resolver = super::FilteredDnsResolver {
-        policy: Arc::new(crate::schema_fetch_policy::SchemaFetchPolicy::default()),
-        proxy_hosts: Arc::new(proxy_hosts.iter().map(|host| host.to_string()).collect()),
-    };
-    let result = resolver
-        .resolve(reqwest::dns::Name::from_str("localhost").unwrap())
-        .await;
-
-    assert_eq!(result.is_ok(), allowed);
+    assert_eq!(body.as_ref(), br#"{"type":"object"}"#);
 }
 
 #[rstest]
@@ -193,7 +184,7 @@ fn schema_urls_must_not_target_the_proxy_host(#[case] url: &str, #[case] allowed
 }
 
 #[rstest]
-#[case::resolves_to_loopback("http://localhost/schema.json", false)]
+#[case::resolves_to_loopback_is_allowed("http://localhost/schema.json", true)]
 #[case::ip_literal_is_left_to_url_check("http://127.0.0.1/schema.json", true)]
 #[case::unresolvable_is_left_to_the_proxy("http://tombi-unresolvable.invalid/schema.json", true)]
 #[tokio::test(flavor = "current_thread")]

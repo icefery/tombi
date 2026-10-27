@@ -98,24 +98,19 @@ impl SchemaFetchPolicy {
         Ok(())
     }
 
-    /// Validate the concrete DNS answers that reqwest will connect to.
-    /// Mixed public/private answers are rejected as a whole.
+    /// Resolved answers are not filtered because schema domains are trusted to the OS resolver.
+    /// IP literals in URLs are still checked by `check_http_url`.
+    /// Configuration errors still fail closed.
     #[cfg(any(test, all(feature = "reqwest", not(target_arch = "wasm32"))))]
     pub(crate) fn check_resolved_addresses(
         &self,
-        host: &str,
+        _host: &str,
         addresses: &[IpAddr],
     ) -> Result<(), PolicyError> {
         self.check_configuration()?;
 
         if addresses.is_empty() {
             return Err(PolicyError::new("DNS returned no addresses"));
-        }
-
-        for address in addresses {
-            if !self.address_is_allowed(host, *address) {
-                return Err(PolicyError::HostNotTrusted);
-            }
         }
 
         Ok(())
@@ -286,39 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn mixed_dns_answers_are_denied() {
-        let policy = SchemaFetchPolicy::default();
-        let addresses = [
-            IpAddr::from_str("8.8.8.8").unwrap(),
-            IpAddr::from_str("127.0.0.1").unwrap(),
-        ];
-
-        assert!(
-            policy
-                .check_resolved_addresses("schema.example", &addresses)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn a_later_dns_answer_is_checked_again_for_rebinding() {
-        let policy = SchemaFetchPolicy::default();
-        let public = [IpAddr::from_str("8.8.8.8").unwrap()];
-        let rebound = [IpAddr::from_str("127.0.0.1").unwrap()];
-
-        assert!(
-            policy
-                .check_resolved_addresses("schema.example", &public)
-                .is_ok()
-        );
-        assert!(
-            policy
-                .check_resolved_addresses("schema.example", &rebound)
-                .is_err()
-        );
-    }
-
-    #[test]
     fn http_urls_reject_credentials_and_local_literals() {
         let policy = SchemaFetchPolicy::default();
         let local = tombi_uri::Uri::from_str("http://127.0.0.1/schema.json").unwrap();
@@ -341,41 +303,29 @@ mod tests {
     #[test]
     fn trust_configuration_is_user_scoped() {
         let policy = SchemaFetchPolicy {
-            trusted_hosts: vec!["schema.internal".to_string()],
+            trusted_hosts: vec!["10.1.2.3".to_string()],
             configuration_error: None,
         };
-        let private = IpAddr::from_str("10.1.2.3").unwrap();
+        let trusted = tombi_uri::Uri::from_str("http://10.1.2.3/schema.json").unwrap();
+        let untrusted = tombi_uri::Uri::from_str("http://10.1.2.4/schema.json").unwrap();
 
-        assert!(
-            policy
-                .check_resolved_addresses("schema.internal", &[private])
-                .is_ok()
-        );
-        assert!(
-            policy
-                .check_resolved_addresses("other.internal", &[private])
-                .is_err()
-        );
+        assert!(policy.check_http_url(&trusted).is_ok());
+        assert!(policy.check_http_url(&untrusted).is_err());
     }
 
     #[test]
     fn options_extend_the_trusted_hosts() {
-        let private = IpAddr::from_str("10.1.2.3").unwrap();
-
         let policy = SchemaFetchPolicy::from_options(&crate::Options {
-            trusted_hosts: Some(vec!["schema.internal".to_string()]),
+            trusted_hosts: Some(vec!["10.1.2.3".to_string()]),
             ..Default::default()
         });
+        let trusted = tombi_uri::Uri::from_str("http://10.1.2.3/schema.json").unwrap();
+        let untrusted = tombi_uri::Uri::from_str("http://10.1.2.4/schema.json").unwrap();
 
-        assert!(
-            policy
-                .check_resolved_addresses("schema.internal", &[private])
-                .is_ok()
-        );
-        assert!(matches!(
-            policy.check_resolved_addresses("other.internal", &[private]),
-            Err(super::PolicyError::HostNotTrusted)
-        ));
+        assert!(policy.check_http_url(&trusted).is_ok());
+        let untrusted_result = policy.check_http_url(&untrusted);
+        let denied = matches!(untrusted_result, Err(super::PolicyError::HostNotTrusted));
+        assert!(denied);
     }
 
     #[test]
@@ -390,5 +340,28 @@ mod tests {
             policy.check_http_url(&public),
             Err(super::PolicyError::Denied { .. })
         ));
+    }
+
+    #[test]
+    fn dns_answers_are_not_filtered() {
+        let policy = SchemaFetchPolicy::default();
+        let fake_ip = [IpAddr::from_str("198.18.0.1").unwrap()];
+        let mixed = [
+            IpAddr::from_str("127.0.0.1").unwrap(),
+            IpAddr::from_str("8.8.8.8").unwrap(),
+        ];
+
+        let fake_ip_ok = policy.check_resolved_addresses("schema.example", &fake_ip);
+        assert!(fake_ip_ok.is_ok());
+        let mixed_ok = policy.check_resolved_addresses("schema.example", &mixed);
+        assert!(mixed_ok.is_ok());
+    }
+
+    #[test]
+    fn dns_answers_still_require_non_empty() {
+        let policy = SchemaFetchPolicy::default();
+
+        let empty_ok = policy.check_resolved_addresses("schema.example", &[]);
+        assert!(empty_ok.is_err());
     }
 }

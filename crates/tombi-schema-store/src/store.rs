@@ -2044,15 +2044,52 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "current_thread")]
-    async fn private_dns_denial_does_not_use_a_stale_schema_cache() {
+    async fn redirect_denial_does_not_use_a_stale_schema_cache() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::atomic::{AtomicBool, Ordering},
+            thread,
+        };
+
         let _cache_home = TestCacheHome::new();
-        let schema_uri = SchemaUri::from_str("http://localhost/security/schema.json").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let server_stop = stop_server.clone();
+        let server = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0; 1024];
+                        let _ = stream.read(&mut request);
+                        let response = b"HTTP/1.1 302\r\nLocation: http://169.254.169.254/\r\n\r\n";
+                        stream.write_all(response).unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if server_stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let url = format!("http://{address}/security/schema.json");
+        let schema_uri = SchemaUri::from_str(&url).unwrap();
         let cache_path = get_cache_file_path(&schema_uri).await.unwrap();
         save_to_cache(Some(&cache_path), br#"{"type":"object"}"#)
             .await
             .unwrap();
 
-        let fetch_policy = Arc::new(SchemaFetchPolicy::default());
+        let fetch_policy = Arc::new(SchemaFetchPolicy::from_options(&crate::Options {
+            trusted_hosts: Some(vec!["127.0.0.1".to_string()]),
+            ..Default::default()
+        }));
         let http_client = Arc::new(ReqwestHttpClient::with_policy(fetch_policy.clone()));
         let schema_store = SchemaStore::new_with_policy_and_http_client(
             crate::Options {
@@ -2066,12 +2103,12 @@ mod tests {
             fetch_policy,
         );
 
-        assert!(
-            schema_store
-                .fetch_schema_document(&schema_uri)
-                .await
-                .is_err()
-        );
+        let result = schema_store.fetch_schema_document(&schema_uri).await;
+        stop_server.store(true, Ordering::Relaxed);
+        server.join().unwrap();
+
+        let denied = matches!(result, Err(crate::Error::SchemaHostNotTrusted { .. }));
+        assert!(denied);
     }
 
     fn bump_modified(path: &Path) {

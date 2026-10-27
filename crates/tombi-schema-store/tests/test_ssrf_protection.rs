@@ -1,5 +1,9 @@
 #![cfg(not(target_arch = "wasm32"))]
 
+//! SSRF guards for schema URLs.
+//! IP literals are still refused before a connection is made.
+//! Domain names are trusted to the OS resolver, so loopback answers are allowed.
+
 use std::{
     io::{Read, Write},
     net::TcpListener,
@@ -18,7 +22,7 @@ use tombi_test_lib::TestCacheHome;
 
 #[rstest]
 #[tokio::test(flavor = "current_thread")]
-async fn schema_fetch_does_not_connect_to_loopback_addresses() {
+async fn schema_fetch_guards_ip_literals_but_not_domain_names() {
     let _cache_home = TestCacheHome::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -62,19 +66,19 @@ async fn schema_fetch_does_not_connect_to_loopback_addresses() {
         }),
         ..Default::default()
     });
-    let mut results = Vec::new();
-    for host in ["127.0.0.1", "localhost"] {
-        let uri =
-            SchemaUri::from_str(&format!("http://{host}:{}/schema.json", address.port())).unwrap();
-        results.push(store.fetch_schema_document(&uri).await);
-    }
+
+    let ip_literal = format!("http://127.0.0.1:{}/schema.json", address.port());
+    let ip_uri = SchemaUri::from_str(&ip_literal).unwrap();
+    let ip_result = store.fetch_schema_document(&ip_uri).await;
+    assert!(matches!(ip_result, Err(Error::SchemaHostNotTrusted { .. })));
+    assert!(!request_received.load(Ordering::Relaxed));
+
+    let domain = format!("http://localhost:{}/schema.json", address.port());
+    let domain_uri = SchemaUri::from_str(&domain).unwrap();
+    let domain_result = store.fetch_schema_document(&domain_uri).await;
     stop_server.store(true, Ordering::Relaxed);
     server.join().unwrap();
 
-    assert!(
-        results
-            .iter()
-            .all(|result| matches!(result, Err(Error::SchemaHostNotTrusted { .. })))
-    );
-    assert!(!request_received.load(Ordering::Relaxed));
+    assert!(domain_result.unwrap().is_some());
+    assert!(request_received.load(Ordering::Relaxed));
 }
